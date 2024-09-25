@@ -18,39 +18,53 @@ import (
 )
 
 var ErrBadCSV = errors.New("bad CSV line")
+var ErrBadWeight = errors.New("negative weight configured")
+var ErrBadSize = errors.New("negative size configured")
+var ErrEmpty = errors.New("no size configured")
 
 type Int64HistogramBar struct {
 	Size   int64 `yaml:"size"`
 	Weight int64 `yaml:"weight"`
 }
 
-type Int64Histogram []Int64HistogramBar
+type Int64Distribution interface {
+	// Produces a new int64 respecting the distribution and based on the given uniform PRNG
+	Poll(r *rand.Rand) int64
+}
+
+type histogramBars []Int64HistogramBar
+
+type int64Histogram struct {
+	bars histogramBars
+}
 
 // Implements sort.Interface
-func (s Int64Histogram) Len() int {
+func (s histogramBars) Len() int {
 	return len(s)
 }
 
 // Implements sort.Interface
-func (s Int64Histogram) Swap(i, j int) {
+func (s histogramBars) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
 // Implements sort.Interface
-func (s Int64Histogram) Less(i, j int) bool {
+func (s histogramBars) Less(i, j int) bool {
 	return s[i].Size < s[j].Size
 }
 
-// Returns a Int64Histogram ready to use, based on a collection of size slots
-func NewSizeHistograms(sizes Int64Histogram) Int64Histogram {
-	sizeHistograms := make(Int64Histogram, len(sizes))
-	sizeHistograms.Init(sizes)
-	return sizeHistograms
+// NewSizeHistograms returns a Int64Distribution implementing histogram-like buckets, ready to use and based on a
+// collection of size bars
+func NewSizeHistograms(sizes []Int64HistogramBar) (Int64Distribution, error) {
+	sizeHistograms := &int64Histogram{
+		bars: make(histogramBars, 0),
+	}
+	return sizeHistograms.init(sizes)
 }
 
-// Returns a Int64Histogram ready to use, based on a collection of size slots described as a coma-separated sequence
-// of "size:weight" values
-func ParseCSV(csv string) (Int64Histogram, error) {
+// ParseCSV returns a Int64Distribution implementing histogram-like buckets, ready to use and based on a collection
+// of size bars described as a coma-separated sequence of "size:weight" values
+func ParseCSV(csv string) (Int64Distribution, error) {
 	tokens := strings.Split(csv, ",")
 	if len(tokens) < 1 {
 		return nil, ErrBadCSV
@@ -58,10 +72,10 @@ func ParseCSV(csv string) (Int64Histogram, error) {
 	return ParseTokens(tokens, ":")
 }
 
-// Returns a Int64Histogram ready to use, based on a collection of size slots stored in an array of "size <separator> weight"
-// tokens
-func ParseTokens(pairs []string, separator string) (Int64Histogram, error) {
-	histograms := make(Int64Histogram, 0)
+// ParseTokens returns a Int64Histogram ready to use, based on a collection of size bars stored in an array of
+// "size <separator> weight" tokens
+func ParseTokens(pairs []string, separator string) (Int64Distribution, error) {
+	histograms := make([]Int64HistogramBar, 0)
 	for _, pair := range pairs {
 		pair = strings.TrimSpace(pair)
 		kv := strings.Split(pair, separator)
@@ -75,33 +89,56 @@ func ParseTokens(pairs []string, separator string) (Int64Histogram, error) {
 		}
 		histograms = append(histograms, bar)
 	}
-	return NewSizeHistograms(histograms), nil
+	return NewSizeHistograms(histograms)
 }
 
 // `sizes` must be non-empty and doesn't need to be sorted
-func (s Int64Histogram) Init(sizes []Int64HistogramBar) {
-	copy(s, sizes)
-	sort.Sort(s)
-	total := int64(0)
-	for i, _ := range s {
-		total += (s)[i].Weight
-		(s)[i].Weight = total
+func (s *int64Histogram) init(sizes []Int64HistogramBar) (*int64Histogram, error) {
+	if len(sizes) == 0 {
+		return nil, ErrEmpty
 	}
+	for _, bar := range sizes {
+		if bar.Weight < 0 {
+			return nil, ErrBadWeight
+		}
+		if bar.Size < 0 {
+			return nil, ErrBadSize
+		}
+		s.bars = append(s.bars, bar)
+	}
+	sort.Sort(s.bars)
+
+	// normalize the bars
+	total := int64(0)
+	for i, _ := range s.bars {
+		total += s.bars[i].Weight
+		s.bars[i].Weight = total
+	}
+
+	return s, nil
 }
 
-func (s Int64Histogram) locate(needle int64) int64 {
-	for i, x := range s {
+func (s *int64Histogram) boundary() int64 {
+	if len(s.bars) == 0 {
+		panic("argl")
+	}
+	return s.bars[len(s.bars)-1].Weight
+}
+
+func (s *int64Histogram) Poll(r *rand.Rand) int64 {
+	needle := r.Int63n(s.boundary())
+	for i, x := range s.bars { // TODO(jfs): a binary search would maybe perform better
 		if x.Weight > needle { // we have the right slot
 			prev := int64(0)
 			if i > 0 {
-				prev = s[i-1].Size
+				prev = s.bars[i-1].Size
 			}
-			return prev + rand.Int63n(x.Size-prev)
+			if x.Size <= 0 {
+				return prev
+			}
+			return prev + r.Int63n(x.Size-prev)
 		}
 	}
 	panic("plop")
-}
 
-func (s Int64Histogram) boundary() int64            { return s[len(s)-1].Weight }
-func (s Int64Histogram) PollRand(r rand.Rand) int64 { return s.locate(r.Int63n(s.boundary())) }
-func (s Int64Histogram) Poll() int64                { return s.locate(rand.Int63n(s.boundary())) }
+}
